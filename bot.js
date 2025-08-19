@@ -1,454 +1,270 @@
-// bot.js
+// bot-tabacaria-4webhooks.js
+// Fluxo: !vender → [Rosh|Copão] → Marca → Sabor → Modal (valor + qtd) → save
+// Usa 4 webhooks: TIPOS->MARCAS, SABORES, LASTPRICE, SAVE
+
+import 'dotenv/config'; // npm i dotenv
 import {
-  Client,
-  GatewayIntentBits,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  Events,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle
+  Client, GatewayIntentBits, Events,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  ModalBuilder, TextInputBuilder, TextInputStyle
 } from 'discord.js';
 import axios from 'axios';
-import fs from 'fs';
-import path from 'path';
-import express from 'express';
-const app = express();
-app.get('/', (_, res) => res.send('ok'));
-app.listen(process.env.PORT || 3000);
 
-
-// ================== CONFIG BÁSICA ==================
+/* ================== CONFIG (via .env) ================== */
+// 1) Token do bot
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const N8N_WEBHOOK   = process.env.N8N_WEBHOOK || '';
 
+// 2) Seus 4 WEBHOOKS
+const WEBHOOK_TIPOS     = process.env.WEBHOOK_TIPOS;     // { tipo } -> { options:[...marcas] }
+const WEBHOOK_SABORES   = process.env.WEBHOOK_SABORES;   // { tipo, marca } -> { options:[...sabores] }
+const WEBHOOK_LASTPRICE = process.env.WEBHOOK_LASTPRICE; // { tipo, marca, sabor } -> { lastPrice:"25.00" }
+const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { tipo, marca, sabor, valor, quantidade, userId, username }
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
-});
+if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN ausente no .env");
+for (const [k, v] of Object.entries({
+  WEBHOOK_TIPOS, WEBHOOK_SABORES, WEBHOOK_LASTPRICE, WEBHOOK_SAVE
+})) if (!v) throw new Error(`${k} ausente no .env`);
 
-// ================== HELPERS DE DATA ==================
-function formatDateYMD(date = new Date()) {
-  const fmt = new Intl.DateTimeFormat('pt-BR', {
-    timeZone: 'America/Sao_Paulo',
-    year: 'numeric', month: '2-digit', day: '2-digit'
-  });
-  const [{ value: dd }, , { value: mm }, , { value: yyyy }] = fmt.formatToParts(date);
-  return `${yyyy}-${mm}-${dd}`;
+/* ================== HELPERS UI ================== */
+function mainMenuRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('item:Rosh').setLabel('Rosh').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('item:Copão').setLabel('Copão').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('menu:refresh').setLabel('Atualizar').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('close').setLabel('Fechar').setStyle(ButtonStyle.Danger),
+  );
 }
-function addDays(date, days) {
-  const d = new Date(date);
-  d.setDate(d.getDate() + days);
-  return d;
+function backRow(scope) { // scope: main | tipo | marca
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`back:${scope}`).setLabel('◀️ Voltar').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('menu:main').setLabel('Menu').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('close').setLabel('Fechar').setStyle(ButtonStyle.Danger),
+  );
 }
-function pad2(n) { return n.toString().padStart(2,'0'); }
-
-// parse de data amigável com sugestão quando ambígua
-function parseDateSmart(input) {
-  const raw = (input || '').trim().toLowerCase();
-
-  if (raw === 'hoje')  return { ok: true, value: formatDateYMD() };
-  if (raw === 'ontem') return { ok: true, value: formatDateYMD(addDays(new Date(), -1)) };
-
-  // dd/mm/aaaa ou dd-mm-aaaa
-  let m = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if (m) {
-    const dd = pad2(m[1]), mm = pad2(m[2]), yyyy = m[3];
-    return { ok: true, value: `${yyyy}-${mm}-${dd}` };
-  }
-
-  // aaaa-mm-dd ou aaaa/mm/dd
-  m = raw.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
-  if (m) {
-    const yyyy = m[1], mm = pad2(m[2]), dd = pad2(m[3]);
-    return { ok: true, value: `${yyyy}-${mm}-${dd}` };
-  }
-
-  // dd/mm (sem ano) -> sugerir ano atual
-  m = raw.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
-  if (m) {
-    const today = new Date();
-    const yyyy = today.getFullYear();
-    const dd = pad2(m[1]), mm = pad2(m[2]);
-    return { ok: false, suggest: `${yyyy}-${mm}-${dd}` };
-  }
-
-  // dd/mm/aa (ano 2 dígitos) -> sugerir 20xx
-  m = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/);
-  if (m) {
-    const dd = pad2(m[1]), mm = pad2(m[2]), aa = m[3];
-    const yyyy = `20${aa}`;
-    return { ok: false, suggest: `${yyyy}-${mm}-${dd}` };
-  }
-
-  return { ok: false, suggest: null };
-}
-
-// ================== UI HELPERS ==================
 function chunkButtons(items, prefix) {
+  const arr = (items || []).map(s => String(s ?? '').trim()).filter(Boolean).slice(0, 25);
   const rows = [];
-  for (let i = 0; i < items.length; i += 5) {
-    const slice = items.slice(i, i + 5);
+  for (let i = 0; i < arr.length; i += 5) {
     const row = new ActionRowBuilder();
-    slice.forEach(label => {
+    arr.slice(i, i + 5).forEach(label => {
       row.addComponents(
-        new ButtonBuilder().setCustomId(`${prefix}:${label}`).setLabel(label).setStyle(ButtonStyle.Primary)
+        new ButtonBuilder()
+          .setCustomId(`${prefix}:${label}`)
+          .setLabel(label.slice(0, 80))
+          .setStyle(ButtonStyle.Primary)
       );
     });
     rows.push(row);
   }
   return rows;
 }
-function backRow(target) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`back:${target}`).setLabel('◀️ Voltar').setStyle(ButtonStyle.Secondary)
-  );
-}
-function tipoMenuRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('tipo:Entrada').setLabel('Entrada 💰').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('tipo:Saída').setLabel('Saída 🧾').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('func:SaldoAtual').setLabel('Saldo Atual 💵').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('func:SaidasPorCategoria').setLabel('Saídas por Categoria 📊').setStyle(ButtonStyle.Secondary)
-  );
-}
+const num = (s, d='') => { const x = String(s ?? '').replace(',', '.').trim(); return x && !isNaN(Number(x)) ? x : d; };
 
-// Seletor rápido de data (sem calendário)
-function dateQuickRows(hasLastDate) {
-  const r1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('date:Hoje').setLabel('Hoje').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('date:Ontem').setLabel('Ontem').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('date:Msg').setLabel('Data da mensagem').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('date:Digit').setLabel('Digitar data').setStyle(ButtonStyle.Secondary)
-  );
-  if (hasLastDate) {
-    const r0 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('date:Ultima').setLabel('Usar última data').setStyle(ButtonStyle.Secondary)
-    );
-    return [r0, r1];
-  }
-  return [r1];
+/* ================== REDE (cada webhook separado) ================== */
+async function post(url, payload, timeout = 15000) {
+  console.log('[POST]', url, JSON.stringify(payload));
+  const { data, status } = await axios.post(url, payload, { timeout });
+  console.log('[RES ]', status, JSON.stringify(data));
+  return data;
 }
-
-// ================== CONFIG DINÂMICA (arquivos) ==================
-const CFG_DIR = path.resolve('./config');
-
-function loadJSON(name, fallback) {
+async function fetchMarcas(tipo) {
+  const data = await post(WEBHOOK_TIPOS, { tipo });
+  return Array.isArray(data?.options) ? data.options : [];
+}
+async function fetchSabores(tipo, marca) {
+  const data = await post(WEBHOOK_SABORES, { tipo, marca });
+  return Array.isArray(data?.options) ? data.options : [];
+}
+async function fetchLastPrice(tipo, marca, sabor) {
   try {
-    const p = path.join(CFG_DIR, name);
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch (e) {
-    console.warn(`[config] Falha ao ler ${name}: ${e.message}`);
-    return fallback;
-  }
+    const data = await post(WEBHOOK_LASTPRICE, { tipo, marca, sabor });
+    const v = String(data?.lastPrice ?? '').replace(',', '.').trim();
+    return v && !isNaN(Number(v)) ? v : '';
+  } catch { return ''; }
+}
+async function saveSale(payload) {
+  await post(WEBHOOK_SAVE, payload);
 }
 
-// valores carregados dinamicamente
-let entradaOptions   = loadJSON('entradas.json', []);
-let categorias       = loadJSON('categorias.json', []);
-let subcats          = loadJSON('subcats.json', {});      // { "Categoria": ["Sub 1", "Sub 2"] }
-let formasPagamento  = loadJSON('pagamentos.json', []);
-let settings         = loadJSON('settings.json', { launchCommand: '!lancar', reloadCommand: '!reload' });
+/* ================== ESTADO ================== */
+const ctxByUser = new Map(); // userId => { tipo, marca, sabor }
 
-// recarrega tudo (usado no !reload e no watcher)
-function reloadAll() {
-  entradaOptions  = loadJSON('entradas.json', []);
-  categorias      = loadJSON('categorias.json', []);
-  subcats         = loadJSON('subcats.json', {});
-  formasPagamento = loadJSON('pagamentos.json', []);
-  settings        = loadJSON('settings.json', { launchCommand: '!lancar', reloadCommand: '!reload' });
-  console.log('[config] Reload completo.');
-}
+/* ================== DISCORD ================== */
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
-// Hot reload automático ao salvar os arquivos
-['entradas.json','categorias.json','subcats.json','pagamentos.json','settings.json'].forEach(file => {
-  const full = path.join(CFG_DIR, file);
-  if (!fs.existsSync(full)) return;
-  fs.watchFile(full, { interval: 1000 }, () => {
-    console.log(`[config] Detectado update em ${file}`);
-    reloadAll();
+client.once(Events.ClientReady, () => console.log(`✅ Bot Tabacaria online: ${client.user.tag}`));
+
+/* Iniciar fluxo com !vender */
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+  if (message.content.trim().toLowerCase() !== '!vender') return;
+
+  ctxByUser.delete(message.author.id);
+  return message.reply({
+    content: '🛒 **Selecione o item vendido:**',
+    components: [mainMenuRow()]
   });
 });
 
-// ================== ESTADO ==================
-const state = new Map();
-/*
-  state por user:
-  {
-    tipo, entrySource, categoria, subcategoria, pagamento,
-    lastDate: 'YYYY-MM-DD',
-    chosenDate: 'YYYY-MM-DD'
-  }
-*/
+/* Interações */
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton() && !interaction.isModalSubmit()) return;
 
-// ================== BOT ==================
-client.once(Events.ClientReady, () => {
-  console.log(`Bot online como ${client.user.tag}`);
-});
-
-// Comandos de texto simples (usando settings.json)
-client.on(Events.MessageCreate, async message => {
-  if (message.author.bot) return;
-
-  const content = message.content.trim();
-  const isLaunch = content.toLowerCase() === settings.launchCommand.toLowerCase();
-  const isReload = content.toLowerCase() === settings.reloadCommand.toLowerCase();
-
-  if (isLaunch) {
-    state.set(message.author.id, {});
-    return message.reply({ content: '📝 **Escolha o que deseja fazer:**', components: [tipoMenuRow()] });
+  // Fechar painel
+  if (interaction.isButton() && interaction.customId === 'close') {
+    ctxByUser.delete(interaction.user.id);
+    return interaction.update({ content: '✅ Fechado.', components: [] });
   }
 
-  if (isReload) {
-    reloadAll();
-    return message.reply('🔄 Configurações recarregadas (entradas, categorias, subcats, pagamentos, settings).');
+  // Voltar/Menu/Refresh
+  if (interaction.isButton() && (interaction.customId === 'menu:main' || interaction.customId === 'menu:refresh')) {
+    ctxByUser.delete(interaction.user.id);
+    return interaction.update({ content: '🛒 **Selecione o item vendido:**', components: [mainMenuRow()] });
   }
-});
+  if (interaction.isButton() && interaction.customId.startsWith('back:')) {
+    const to  = interaction.customId.split(':')[1];
+    const ctx = ctxByUser.get(interaction.user.id) || {};
 
-client.on(Events.InteractionCreate, async interaction => {
-  // -------------------- BOTÕES --------------------
-  if (interaction.isButton()) {
-    const [stage, value] = interaction.customId.split(':');
-    const userId = interaction.user.id;
-    const ctx = state.get(userId) || {};
-
-    // -------- Funções (Saldo / Saídas por Categoria) --------
-    if (stage === 'func') {
-      await axios.post(N8N_WEBHOOK, { action: value === 'SaldoAtual' ? 'saldo_atual' : 'saidas_por_categoria', user: interaction.user.username });
-      return interaction.deferUpdate();
+    if (to === 'main') {
+      ctxByUser.delete(interaction.user.id);
+      return interaction.update({ content: '🛒 **Selecione o item vendido:**', components: [mainMenuRow()] });
     }
-
-    // -------- Voltar --------
-    if (stage === 'back') {
-      if (value === 'main' || value === 'tipo') {
-        state.set(userId, {});
-        return interaction.update({ content: '📝 **Escolha o que deseja fazer:**', components: [tipoMenuRow()] });
-      }
-      if (value === 'cat') {
-        ctx.subcategoria = undefined; ctx.pagamento = undefined;
-        state.set(userId, ctx);
-        return interaction.update({
-          content: '🧾 **Saída** selecionada. Agora escolha a *categoria*:',
-          components: [...chunkButtons(categorias, 'cat'), backRow('tipo')]
-        });
-      }
-      if (value === 'entr') {
-        ctx.pagamento = undefined;
-        state.set(userId, ctx);
-        return interaction.update({
-          content: '💼 **Entrada** selecionada. Agora escolha a *origem*:',
-          components: [...chunkButtons(entradaOptions, 'entr'), backRow('tipo')]
-        });
-      }
-    }
-
-    // -------- Tipo --------
-    if (stage === 'tipo') {
-      ctx.tipo = value;
-      ctx.entrySource = ctx.categoria = ctx.subcategoria = ctx.pagamento = undefined;
-      state.set(userId, ctx);
-
-      if (value === 'Entrada') {
-        return interaction.update({
-          content: '💼 **Entrada** selecionada. Agora escolha a *origem*:',
-          components: [...chunkButtons(entradaOptions, 'entr'), backRow('tipo')]
-        });
-      } else {
-        return interaction.update({
-          content: '🧾 **Saída** selecionada. Agora escolha a *categoria*:',
-          components: [...chunkButtons(categorias, 'cat'), backRow('tipo')]
-        });
-      }
-    }
-
-    // -------- Entrada: origem --------
-    if (stage === 'entr') {
-      ctx.entrySource = value;
-      state.set(userId, ctx);
+    if (to === 'tipo') {
+      const marcas = await fetchMarcas(ctx.tipo);
       return interaction.update({
-        content: `📥 **Origem:** ${value}. Agora escolha *forma de pagamento*:`,
-        components: [...chunkButtons(formasPagamento, 'pay'), backRow('entr')]
+        content: `🛒 **${ctx.tipo}** — escolha a **Marca**:`,
+        components: [...chunkButtons(marcas, 'marca'), backRow('main')]
       });
     }
-
-    // -------- Saída: categoria -> subcategoria (com proteção) --------
-    if (stage === 'cat') {
-      ctx.categoria = value; ctx.subcategoria = undefined;
-      state.set(userId, ctx);
-
-      const subs = subcats[value] || [];
-      if (!subs.length) {
-        return interaction.update({
-          content: `⚠️ **${value}** ainda não tem subcategorias. Edite **/config/subcats.json** para adicioná-las.`,
-          components: [backRow('cat')]
-        });
-      }
-
+    if (to === 'marca') {
+      const sabores = await fetchSabores(ctx.tipo, ctx.marca);
       return interaction.update({
-        content: `📑 **Categoria:** ${value}. Agora escolha a *subcategoria*:`,
-        components: [...chunkButtons(subs, 'sub'), backRow('cat')]
+        content: `🛒 **${ctx.tipo} / ${ctx.marca}** — escolha o **Sabor**:`,
+        components: [...chunkButtons(sabores, 'sabor'), backRow('tipo')]
       });
-    }
-
-    if (stage === 'sub') {
-      ctx.subcategoria = value;
-      state.set(userId, ctx);
-      return interaction.update({
-        content: `💳 **Subcategoria:** ${value}. Agora escolha *forma de pagamento*:`,
-        components: [...chunkButtons(formasPagamento, 'pay'), backRow('cat')]
-      });
-    }
-
-    // -------- Forma de pagamento -> seletor de data --------
-    if (stage === 'pay') {
-      ctx.pagamento = value;
-      state.set(userId, ctx);
-      const hasLast = !!ctx.lastDate;
-      return interaction.update({
-        content: '🗓️ **Escolha a data do lançamento:**',
-        components: [...dateQuickRows(hasLast), backRow('entr')]
-      });
-    }
-
-    // -------- Date quick actions (sem calendário) --------
-    if (stage === 'date') {
-      if (value === 'Digit') {
-        // abrir modal de Data + Valor
-        const modal = new ModalBuilder().setCustomId('lancamentoModal').setTitle('Data e Valor');
-        const inputData = new TextInputBuilder()
-          .setCustomId('date').setLabel('Data (AAAA-MM-DD, "hoje"/"ontem")')
-          .setStyle(TextInputStyle.Short).setPlaceholder('ex: 2025-08-09 ou "hoje"').setRequired(true);
-        const inputValor = new TextInputBuilder()
-          .setCustomId('valor').setLabel('Valor (somente números)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('ex: 250').setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(inputData), new ActionRowBuilder().addComponents(inputValor));
-        return interaction.showModal(modal);
-      }
-
-      let chosen = null;
-      if (value === 'Hoje')   chosen = formatDateYMD();
-      if (value === 'Ontem')  chosen = formatDateYMD(addDays(new Date(), -1));
-      if (value === 'Ultima' && ctx.lastDate) chosen = ctx.lastDate;
-      if (value === 'Msg')    chosen = formatDateYMD(interaction.createdAt);
-
-      if (chosen) {
-        ctx.chosenDate = chosen;
-        state.set(userId, ctx);
-        // abrir modal só de Valor (data já definida)
-        const modal = new ModalBuilder().setCustomId('valorModal').setTitle(`Valor para ${chosen}`);
-        const inputValor = new TextInputBuilder()
-          .setCustomId('valor').setLabel('Valor (somente números)')
-          .setStyle(TextInputStyle.Short).setPlaceholder('ex: 250').setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(inputValor));
-        return interaction.showModal(modal);
-      }
-      return;
     }
   }
 
-  // -------------------- MODAIS --------------------
-  if (interaction.isModalSubmit()) {
-    const userId = interaction.user.id;
-    const ctx = state.get(userId) || {};
+  // Passo 1: Rosh/Copão → marcas
+  if (interaction.isButton() && interaction.customId.startsWith('item:')) {
+    const tipo = interaction.customId.split(':')[1];
+    ctxByUser.set(interaction.user.id, { tipo });
 
-    // Modal com data + valor (digitado)
-    if (interaction.customId === 'lancamentoModal') {
-      const rawDate = interaction.fields.getTextInputValue('date');
-      let valor = interaction.fields.getTextInputValue('valor').trim();
-      valor = valor.replace(',', '.');
+    let marcas = [];
+    try { marcas = await fetchMarcas(tipo); }
+    catch {
+      return interaction.update({
+        content: `❌ Erro ao consultar **marcas** para **${tipo}**.`,
+        components: [mainMenuRow()]
+      });
+    }
 
-      const parsed = parseDateSmart(rawDate);
-      if (!parsed.ok) {
-        if (parsed.suggest) {
-          const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`datefix:accept:${parsed.suggest}`).setLabel(`Confirmar: ${parsed.suggest}`).setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`datefix:deny:${rawDate}`).setLabel('Editar data').setStyle(ButtonStyle.Secondary)
-          );
-          await interaction.reply({ content: `❓ Não entendi a data **"${rawDate}"**. Você quis dizer **${parsed.suggest}**?`, components: [row], ephemeral: true });
-          return;
-        } else {
-          await interaction.reply({ content: '❌ Data inválida. Use **AAAA-MM-DD** ou "hoje"/"ontem".', ephemeral: true });
-          return;
-        }
-      }
+    if (!marcas.length) {
+      return interaction.update({
+        content: `⚠️ Webhook de marcas respondeu sem **options** para **${tipo}** (esperado {"options":[...]}).`,
+        components: [mainMenuRow()]
+      });
+    }
 
-      const dataNorm = parsed.value;
-      ctx.lastDate = dataNorm;
-      state.set(userId, ctx);
+    return interaction.update({
+      content: `🛒 **${tipo}** — escolha a **Marca**:`,
+      components: [...chunkButtons(marcas, 'marca'), backRow('main')]
+    });
+  }
 
-      const payload = {
+  // Passo 2: Marca → sabores
+  if (interaction.isButton() && interaction.customId.startsWith('marca:')) {
+    const marca = interaction.customId.split(':')[1];
+    const ctx = ctxByUser.get(interaction.user.id) || {};
+    ctx.marca = marca;
+    ctxByUser.set(interaction.user.id, ctx);
+
+    let sabores = [];
+    try { sabores = await fetchSabores(ctx.tipo, ctx.marca); }
+    catch {
+      return interaction.update({
+        content: `❌ Erro ao consultar **sabores** de **${ctx.marca}**.`,
+        components: [backRow('tipo')]
+      });
+    }
+
+    if (!sabores.length) {
+      return interaction.update({
+        content: `⚠️ Webhook de sabores respondeu sem **options** para **${ctx.marca}**.`,
+        components: [backRow('tipo')]
+      });
+    }
+
+    return interaction.update({
+      content: `🛒 **${ctx.tipo} / ${ctx.marca}** — escolha o **Sabor**:`,
+      components: [...chunkButtons(sabores, 'sabor'), backRow('tipo')]
+    });
+  }
+
+  // Passo 3: Sabor → lastPrice + modal
+  if (interaction.isButton() && interaction.customId.startsWith('sabor:')) {
+    const sabor = interaction.customId.split(':')[1];
+    const ctx = ctxByUser.get(interaction.user.id) || {};
+    ctx.sabor = sabor;
+    ctxByUser.set(interaction.user.id, ctx);
+
+    const lastPrice = await fetchLastPrice(ctx.tipo, ctx.marca, ctx.sabor);
+
+    const modal = new ModalBuilder()
+      .setCustomId('modal:save')
+      .setTitle(`Registrar ${ctx.tipo}/${ctx.marca}/${ctx.sabor}`);
+
+    const inputValor = new TextInputBuilder()
+      .setCustomId('valor')
+      .setLabel('Valor (ex: 25.00)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+    if (lastPrice) inputValor.setValue(lastPrice);
+
+    const inputQtd = new TextInputBuilder()
+      .setCustomId('qtd')
+      .setLabel('Quantidade')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setValue('1');
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(inputValor),
+      new ActionRowBuilder().addComponents(inputQtd),
+    );
+
+    return interaction.showModal(modal);
+  }
+
+  // Passo 4: Modal → save
+  if (interaction.isModalSubmit() && interaction.customId === 'modal:save') {
+    await interaction.deferReply({ ephemeral: true });
+
+    const valor = num(interaction.fields.getTextInputValue('valor'), '');
+    const quantidade = num(interaction.fields.getTextInputValue('qtd'), '1');
+    if (!valor) return interaction.editReply('❌ Valor inválido.');
+    if (!quantidade || Number(quantidade) <= 0) return interaction.editReply('❌ Quantidade inválida.');
+
+    const ctx = ctxByUser.get(interaction.user.id) || {};
+    if (!ctx.tipo || !ctx.marca || !ctx.sabor) {
+      return interaction.editReply('❌ Fluxo incompleto. Use **!vender** de novo.');
+    }
+
+    try {
+      await saveSale({
         tipo: ctx.tipo,
-        pagamento: ctx.pagamento,
-        data: dataNorm,
+        marca: ctx.marca,
+        sabor: ctx.sabor,
         valor,
-        user: interaction.user.username
-      };
-      if (ctx.tipo === 'Entrada') payload.origem = ctx.entrySource;
-      else { payload.categoria = ctx.categoria; payload.subcategoria = ctx.subcategoria; }
+        quantidade,
+        userId: interaction.user.id,
+        username: interaction.user.username,
+      });
 
-      try {
-        await axios.post(N8N_WEBHOOK, payload);
-        await interaction.reply({ content: '✅ Lançamento registrado!', ephemeral: true });
-      } catch {
-        await interaction.reply({ content: '❌ Falha ao enviar pro n8n.', ephemeral: true });
-      } finally {
-        state.delete(userId);
-      }
-    }
-
-    // Modal só de valor (data já escolhida por botão rápido)
-    if (interaction.customId === 'valorModal') {
-      let valor = interaction.fields.getTextInputValue('valor').trim();
-      valor = valor.replace(',', '.');
-
-      const dataNorm = ctx.chosenDate || ctx.lastDate || formatDateYMD();
-      const payload = {
-        tipo: ctx.tipo,
-        pagamento: ctx.pagamento,
-        data: dataNorm,
-        valor,
-        user: interaction.user.username
-      };
-      if (ctx.tipo === 'Entrada') payload.origem = ctx.entrySource;
-      else { payload.categoria = ctx.categoria; payload.subcategoria = ctx.subcategoria; }
-
-      try {
-        await axios.post(N8N_WEBHOOK, payload);
-        await interaction.reply({ content: `✅ Lançamento registrado para **${dataNorm}**!`, ephemeral: true });
-      } catch {
-        await interaction.reply({ content: '❌ Falha ao enviar pro n8n.', ephemeral: true });
-      } finally {
-        state.delete(userId);
-      }
-    }
-
-    // Correção de data sugerida (confirmar/editar)
-    if (interaction.customId.startsWith('datefix:')) {
-      const parts = interaction.customId.split(':'); // datefix:accept|deny:value
-      const action = parts[1];
-      const value  = parts[2];
-
-      if (action === 'accept') {
-        const fixed = value; // YYYY-MM-DD
-        const modal = new ModalBuilder().setCustomId('valorModal').setTitle(`Valor para ${fixed}`);
-        const inputValor = new TextInputBuilder().setCustomId('valor').setLabel('Valor (somente números)').setStyle(TextInputStyle.Short).setPlaceholder('ex: 250').setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(inputValor));
-
-        const ctx2 = state.get(interaction.user.id) || {};
-        ctx2.chosenDate = fixed;
-        ctx2.lastDate   = fixed;
-        state.set(interaction.user.id, ctx2);
-
-        await interaction.update({ content: `🗓️ Data ajustada para **${fixed}**. Informe o valor:`, components: [] });
-        return interaction.showModal(modal);
-      } else {
-        const modal = new ModalBuilder().setCustomId('lancamentoModal').setTitle('Data e Valor');
-        const inputData = new TextInputBuilder().setCustomId('date').setLabel('Data (AAAA-MM-DD, "hoje"/"ontem")').setStyle(TextInputStyle.Short).setPlaceholder('ex: 2025-08-09').setRequired(true);
-        const inputValor = new TextInputBuilder().setCustomId('valor').setLabel('Valor (somente números)').setStyle(TextInputStyle.Short).setPlaceholder('ex: 250').setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(inputData), new ActionRowBuilder().addComponents(inputValor));
-        return interaction.showModal(modal);
-      }
+      await interaction.editReply(`✅ Registrado: **${ctx.tipo} / ${ctx.marca} / ${ctx.sabor}** — **${quantidade}x** a **R$ ${Number(valor).toFixed(2)}**.`);
+    } catch (e) {
+      console.error('SAVE ERROR', e?.response?.status, e?.response?.data || e.message);
+      await interaction.editReply('❌ Falha ao salvar no n8n.');
     }
   }
 });
