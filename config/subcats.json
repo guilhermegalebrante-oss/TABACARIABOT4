@@ -1,0 +1,8 @@
+{
+  "Casa 🏠": ["Moradia 🏠","Itens Domésticos 🧺","Reformas & Obras 🧱","Assinaturas 📺","Serviços 🛠️","Seguro 🛡️","Pets 🐶","Internet & Telefonia 📡"],
+  "Consumo 🛒": ["Alimentação 🛒","Delivery / Fora de Casa 🍔","Vestuário 👕","Presentes 🎁","Eventos & Festas 🎉","Lazer & Entretenimento 🎮","Chopp 🍺"],
+  "Finanças 💳": ["Impostos & Taxas 💰","Cartões 💳","Dívidas / Empréstimos 💣","Investimentos 📈","Tarifas Bancárias 🏦","Viagens ✈️","Doações Rua 🙌","Despesas eventuais 💸","Planejamento / Reserva 💼","Dinheiro Emprestado 💸"],
+  "Transporte 🚘": ["Transporte 🚗","Combustível ⛽","Manutenção Veículo 🔧","Multas ⚠️","Outros Meios 🚌","Estacionamento / Pedágio 🅿️"],
+  "Pessoal 💈": ["Academia / Bem-estar 🧘","Cuidados Pessoais 💈","Saúde 🏥","Educação 🎓","Desenvolvimento 📚","Tecnologia 💻","Narguile 💨","ChatGPT 🤖"],
+  "Outros 🟨": ["Documentos / Burocracias 📄","Consertos Diversos 🔧","Multas não veiculares ⚖️","Perdas Financeiras 💸","Fraudes 💀","Doações pontuais 🙏","Parcelas / Ajustes Pendentes 🧾","Sorteios / Rifas 🎫","Gastos Inclassificáveis ❔","Prime 🌆"]
+}
