@@ -1,8 +1,8 @@
-// bot-tabacaria-4webhooks.js
+// bot.js
 // Fluxo: !vender → [Rosh|Copão] → Marca → Sabor → Modal (valor + qtd) → save
-// Usa 4 webhooks: TIPOS->MARCAS, SABORES, LASTPRICE, SAVE
+// Webhooks: TIPOS->MARCAS, SABORES, (opcional) LASTPRICE, SAVE
 
-import 'dotenv/config'; // npm i dotenv
+import 'dotenv/config';
 import {
   Client, GatewayIntentBits, Events,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
@@ -10,20 +10,19 @@ import {
 } from 'discord.js';
 import axios from 'axios';
 
-/* ================== CONFIG (via .env) ================== */
-// 1) Token do bot
+/* ================== ENV ================== */
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
-// 2) Seus 4 WEBHOOKS
 const WEBHOOK_TIPOS     = process.env.WEBHOOK_TIPOS;     // { tipo } -> { options:[...marcas] }
 const WEBHOOK_SABORES   = process.env.WEBHOOK_SABORES;   // { tipo, marca } -> { options:[...sabores] }
-const WEBHOOK_LASTPRICE = process.env.WEBHOOK_LASTPRICE; // { tipo, marca, sabor } -> { lastPrice:"25.00" }
+const WEBHOOK_LASTPRICE = process.env.WEBHOOK_LASTPRICE; // { tipo, marca, sabor } -> { lastPrice:"25.00" } (opcional)
 const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { tipo, marca, sabor, valor, quantidade, userId, username }
 
-if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN ausente no .env");
-for (const [k, v] of Object.entries({
-  WEBHOOK_TIPOS, WEBHOOK_SABORES, WEBHOOK_LASTPRICE, WEBHOOK_SAVE
-})) if (!v) throw new Error(`${k} ausente no .env`);
+if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN ausente nas variáveis de ambiente");
+for (const [k, v] of Object.entries({ WEBHOOK_TIPOS, WEBHOOK_SABORES, WEBHOOK_SAVE })) {
+  if (!v) throw new Error(`${k} ausente nas variáveis de ambiente`);
+}
+const HAS_LASTPRICE = !!WEBHOOK_LASTPRICE;
 
 /* ================== HELPERS UI ================== */
 function mainMenuRow() {
@@ -60,11 +59,9 @@ function chunkButtons(items, prefix) {
 }
 const num = (s, d='') => { const x = String(s ?? '').replace(',', '.').trim(); return x && !isNaN(Number(x)) ? x : d; };
 
-/* ================== REDE (cada webhook separado) ================== */
+/* ================== REDE ================== */
 async function post(url, payload, timeout = 15000) {
-  console.log('[POST]', url, JSON.stringify(payload));
-  const { data, status } = await axios.post(url, payload, { timeout });
-  console.log('[RES ]', status, JSON.stringify(data));
+  const { data } = await axios.post(url, payload, { timeout });
   return data;
 }
 async function fetchMarcas(tipo) {
@@ -76,6 +73,7 @@ async function fetchSabores(tipo, marca) {
   return Array.isArray(data?.options) ? data.options : [];
 }
 async function fetchLastPrice(tipo, marca, sabor) {
+  if (!HAS_LASTPRICE) return '';
   try {
     const data = await post(WEBHOOK_LASTPRICE, { tipo, marca, sabor });
     const v = String(data?.lastPrice ?? '').replace(',', '.').trim();
@@ -90,11 +88,13 @@ async function saveSale(payload) {
 const ctxByUser = new Map(); // userId => { tipo, marca, sabor }
 
 /* ================== DISCORD ================== */
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+});
 
 client.once(Events.ClientReady, () => console.log(`✅ Bot Tabacaria online: ${client.user.tag}`));
 
-/* Iniciar fluxo com !vender */
+/* Trigger: !vender */
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (message.content.trim().toLowerCase() !== '!vender') return;
@@ -110,17 +110,19 @@ client.on(Events.MessageCreate, async (message) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton() && !interaction.isModalSubmit()) return;
 
-  // Fechar painel
+  // Fechar
   if (interaction.isButton() && interaction.customId === 'close') {
     ctxByUser.delete(interaction.user.id);
     return interaction.update({ content: '✅ Fechado.', components: [] });
   }
 
-  // Voltar/Menu/Refresh
+  // Menu / Refresh
   if (interaction.isButton() && (interaction.customId === 'menu:main' || interaction.customId === 'menu:refresh')) {
     ctxByUser.delete(interaction.user.id);
     return interaction.update({ content: '🛒 **Selecione o item vendido:**', components: [mainMenuRow()] });
   }
+
+  // Voltar
   if (interaction.isButton() && interaction.customId.startsWith('back:')) {
     const to  = interaction.customId.split(':')[1];
     const ctx = ctxByUser.get(interaction.user.id) || {};
@@ -145,31 +147,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // Passo 1: Rosh/Copão → marcas
+  // Passo 1: Tipo → marcas
   if (interaction.isButton() && interaction.customId.startsWith('item:')) {
     const tipo = interaction.customId.split(':')[1];
     ctxByUser.set(interaction.user.id, { tipo });
 
-    let marcas = [];
-    try { marcas = await fetchMarcas(tipo); }
-    catch {
+    try {
+      const marcas = await fetchMarcas(tipo);
+      if (!marcas.length) {
+        return interaction.update({
+          content: `⚠️ Webhook de marcas respondeu sem **options** para **${tipo}**.`,
+          components: [mainMenuRow()]
+        });
+      }
       return interaction.update({
-        content: `❌ Erro ao consultar **marcas** para **${tipo}**.`,
+        content: `🛒 **${tipo}** — escolha a **Marca**:`,
+        components: [...chunkButtons(marcas, 'marca'), backRow('main')]
+      });
+    } catch {
+      return interaction.update({
+        content: `❌ Erro ao consultar **marcas** de **${tipo}**.`,
         components: [mainMenuRow()]
       });
     }
-
-    if (!marcas.length) {
-      return interaction.update({
-        content: `⚠️ Webhook de marcas respondeu sem **options** para **${tipo}** (esperado {"options":[...]}).`,
-        components: [mainMenuRow()]
-      });
-    }
-
-    return interaction.update({
-      content: `🛒 **${tipo}** — escolha a **Marca**:`,
-      components: [...chunkButtons(marcas, 'marca'), backRow('main')]
-    });
   }
 
   // Passo 2: Marca → sabores
@@ -179,29 +179,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
     ctx.marca = marca;
     ctxByUser.set(interaction.user.id, ctx);
 
-    let sabores = [];
-    try { sabores = await fetchSabores(ctx.tipo, ctx.marca); }
-    catch {
+    try {
+      const sabores = await fetchSabores(ctx.tipo, ctx.marca);
+      if (!sabores.length) {
+        return interaction.update({
+          content: `⚠️ Webhook de sabores respondeu sem **options** para **${ctx.marca}**.`,
+          components: [backRow('tipo')]
+        });
+      }
+      return interaction.update({
+        content: `🛒 **${ctx.tipo} / ${ctx.marca}** — escolha o **Sabor**:`,
+        components: [...chunkButtons(sabores, 'sabor'), backRow('tipo')]
+      });
+    } catch {
       return interaction.update({
         content: `❌ Erro ao consultar **sabores** de **${ctx.marca}**.`,
         components: [backRow('tipo')]
       });
     }
-
-    if (!sabores.length) {
-      return interaction.update({
-        content: `⚠️ Webhook de sabores respondeu sem **options** para **${ctx.marca}**.`,
-        components: [backRow('tipo')]
-      });
-    }
-
-    return interaction.update({
-      content: `🛒 **${ctx.tipo} / ${ctx.marca}** — escolha o **Sabor**:`,
-      components: [...chunkButtons(sabores, 'sabor'), backRow('tipo')]
-    });
   }
 
-  // Passo 3: Sabor → lastPrice + modal
+  // Passo 3: Sabor → modal (com lastPrice se disponível)
   if (interaction.isButton() && interaction.customId.startsWith('sabor:')) {
     const sabor = interaction.customId.split(':')[1];
     const ctx = ctxByUser.get(interaction.user.id) || {};
