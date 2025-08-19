@@ -1,17 +1,15 @@
 {
-  "name": "discord-n8n-bot",
+  "name": "tabacariabot",
   "version": "1.0.0",
   "type": "module",
   "main": "bot.js",
-  "engines": {
-    "node": ">=20"
-  },
   "scripts": {
     "start": "node bot.js"
   },
+  "engines": { "node": "20.x" },
   "dependencies": {
-    "axios": "^1.11.0",
-    "discord.js": "^14.21.0",
-    "express": "^4.19.2"
+    "axios": "^1.7.3",
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5"
   }
 }
