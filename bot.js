@@ -1,5 +1,5 @@
 // bot.js
-// Fluxo: !vender → [Rosh|Copão] → Marca → Sabor → Modal (valor + qtd) → save
+// Fluxo: !vender → [Rosh|Copão] → Marca → Sabor → Modal (valor + qtd + mesa + obs) → save
 // Webhooks: TIPOS->MARCAS, SABORES, (opcional) LASTPRICE, SAVE
 
 import 'dotenv/config';
@@ -16,7 +16,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const WEBHOOK_TIPOS     = process.env.WEBHOOK_TIPOS;     // { tipo } -> { options:[...marcas] }
 const WEBHOOK_SABORES   = process.env.WEBHOOK_SABORES;   // { tipo, marca } -> { options:[...sabores] }
 const WEBHOOK_LASTPRICE = process.env.WEBHOOK_LASTPRICE; // { tipo, marca, sabor } -> { lastPrice:"25.00" } (opcional)
-const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { tipo, marca, sabor, valor, quantidade, userId, username }
+const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { tipo, marca, sabor, valor, quantidade, mesa, observacao, userId, username }
 
 if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN ausente nas variáveis de ambiente");
 for (const [k, v] of Object.entries({ WEBHOOK_TIPOS, WEBHOOK_SABORES, WEBHOOK_SAVE })) {
@@ -58,6 +58,7 @@ function chunkButtons(items, prefix) {
   return rows;
 }
 const num = (s, d='') => { const x = String(s ?? '').replace(',', '.').trim(); return x && !isNaN(Number(x)) ? x : d; };
+const txt = (s) => String(s ?? '').trim();
 
 /* ================== REDE ================== */
 async function post(url, payload, timeout = 15000) {
@@ -226,9 +227,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setRequired(true)
       .setValue('1');
 
+    const inputMesa = new TextInputBuilder()
+      .setCustomId('mesa')
+      .setLabel('Mesa (ex: Mesa 1)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    const inputObs = new TextInputBuilder()
+      .setCustomId('obs')
+      .setLabel('Observação (ex: nome da pessoa / observações)')
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(false);
+
     modal.addComponents(
       new ActionRowBuilder().addComponents(inputValor),
       new ActionRowBuilder().addComponents(inputQtd),
+      new ActionRowBuilder().addComponents(inputMesa),
+      new ActionRowBuilder().addComponents(inputObs),
     );
 
     return interaction.showModal(modal);
@@ -240,8 +255,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const valor = num(interaction.fields.getTextInputValue('valor'), '');
     const quantidade = num(interaction.fields.getTextInputValue('qtd'), '1');
+    const mesa = txt(interaction.fields.getTextInputValue('mesa'));
+    const observacao = txt(interaction.fields.getTextInputValue('obs'));
+
     if (!valor) return interaction.editReply('❌ Valor inválido.');
     if (!quantidade || Number(quantidade) <= 0) return interaction.editReply('❌ Quantidade inválida.');
+    if (!mesa) return interaction.editReply('❌ Informe a **Mesa** (ex: Mesa 1).');
 
     const ctx = ctxByUser.get(interaction.user.id) || {};
     if (!ctx.tipo || !ctx.marca || !ctx.sabor) {
@@ -255,11 +274,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         sabor: ctx.sabor,
         valor,
         quantidade,
+        mesa,
+        observacao,
         userId: interaction.user.id,
         username: interaction.user.username,
       });
 
-      await interaction.editReply(`✅ Registrado: **${ctx.tipo} / ${ctx.marca} / ${ctx.sabor}** — **${quantidade}x** a **R$ ${Number(valor).toFixed(2)}**.`);
+      await interaction.editReply(
+        `✅ Registrado: **${ctx.tipo} / ${ctx.marca} / ${ctx.sabor}** — **${quantidade}x** a **R$ ${Number(valor).toFixed(2)}**.\n` +
+        `📍 **${mesa}**${observacao ? ` · 📝 ${observacao}` : ''}`
+      );
     } catch (e) {
       console.error('SAVE ERROR', e?.response?.status, e?.response?.data || e.message);
       await interaction.editReply('❌ Falha ao salvar no n8n.');
