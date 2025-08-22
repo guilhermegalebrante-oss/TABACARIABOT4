@@ -6,23 +6,30 @@ import 'dotenv/config';
 import {
   Client, GatewayIntentBits, Events,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  ModalBuilder, TextInputBuilder, TextInputStyle
+  ModalBuilder, TextInputBuilder, TextInputStyle,
+  Partials
 } from 'discord.js';
 import axios from 'axios';
 
 /* ================== ENV ================== */
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_TOKEN     = process.env.DISCORD_TOKEN;
 
 const WEBHOOK_TIPOS     = process.env.WEBHOOK_TIPOS;     // { tipo } -> { options:[...marcas] }
 const WEBHOOK_SABORES   = process.env.WEBHOOK_SABORES;   // { tipo, marca } -> { options:[...sabores] }
 const WEBHOOK_LASTPRICE = process.env.WEBHOOK_LASTPRICE; // { tipo, marca, sabor } -> { lastPrice:"25.00" } (opcional)
-const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { tipo, marca, sabor, valor, quantidade, mesa, observacao, userId, username }
+const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { tipo, marca, sabor, valor, quantidade, mesa, observacao, userId, username, channelId, channelName, guildId, guildName }
 
-if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN ausente nas variáveis de ambiente");
+if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN ausente');
 for (const [k, v] of Object.entries({ WEBHOOK_TIPOS, WEBHOOK_SABORES, WEBHOOK_SAVE })) {
   if (!v) throw new Error(`${k} ausente nas variáveis de ambiente`);
 }
 const HAS_LASTPRICE = !!WEBHOOK_LASTPRICE;
+
+// Whitelist opcional: nomes de canais separados por vírgula (ex: "loja-centro,loja-bairro")
+const CHANNEL_WHITELIST = (process.env.CHANNEL_WHITELIST || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 /* ================== HELPERS UI ================== */
 function mainMenuRow() {
@@ -90,19 +97,49 @@ const ctxByUser = new Map(); // userId => { tipo, marca, sabor }
 
 /* ================== DISCORD ================== */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel, Partials.Message]
 });
 
 client.once(Events.ClientReady, () => console.log(`✅ Bot Tabacaria online: ${client.user.tag}`));
+
+/* Util: pega nome do canal com fallback (inclusive thread/DM) */
+async function resolveChannelName(interactionOrMessage) {
+  try {
+    const channel = interactionOrMessage.channel
+      ?? await client.channels.fetch(interactionOrMessage.channelId);
+    if (!channel) return null;
+    if ('name' in channel && channel.name) return channel.name;
+    if ('isDMBased' in channel && channel.isDMBased?.()) return 'DM';
+    // threads costumam ter name também
+    return channel?.name ?? null;
+  } catch { return null; }
+}
+function allowedByWhitelist(channelName) {
+  if (CHANNEL_WHITELIST.length === 0) return true;
+  return channelName && CHANNEL_WHITELIST.includes(channelName);
+}
 
 /* Trigger: !vender */
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (message.content.trim().toLowerCase() !== '!vender') return;
 
+  // bloquear DM
+  if (!message.guildId) return message.reply('⚠️ Use este comando dentro de um servidor (DM desativado).');
+
+  const channelName = 'name' in message.channel ? message.channel.name : null;
+  if (!allowedByWhitelist(channelName)) {
+    return message.reply('⛔ Este canal não está habilitado para registrar vendas.');
+  }
+
   ctxByUser.delete(message.author.id);
   return message.reply({
-    content: '🛒 **Selecione o item vendido:**',
+    content: `🛒 **Selecione o item vendido:**` + (channelName ? `\n#️⃣ Canal: **${channelName}**` : ''),
     components: [mainMenuRow()]
   });
 });
@@ -110,6 +147,20 @@ client.on(Events.MessageCreate, async (message) => {
 /* Interações */
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton() && !interaction.isModalSubmit()) return;
+
+  // bloquear DM
+  if (!interaction.guildId) {
+    if (interaction.isButton()) return interaction.reply({ content: '⚠️ Use dentro de um servidor.', ephemeral: true });
+    if (interaction.isModalSubmit()) return interaction.reply({ content: '⚠️ Use dentro de um servidor.', ephemeral: true });
+    return;
+  }
+
+  const channelName = await resolveChannelName(interaction);
+  if (!allowedByWhitelist(channelName)) {
+    if (interaction.isButton()) return interaction.reply({ content: '⛔ Canal não habilitado.', ephemeral: true });
+    if (interaction.isModalSubmit()) return interaction.reply({ content: '⛔ Canal não habilitado.', ephemeral: true });
+    return;
+  }
 
   // Fechar
   if (interaction.isButton() && interaction.customId === 'close') {
@@ -249,7 +300,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.showModal(modal);
   }
 
-  // Passo 4: Modal → save
+  // Passo 4: Modal → save (com metadados de canal/servidor)
   if (interaction.isModalSubmit() && interaction.customId === 'modal:save') {
     await interaction.deferReply({ ephemeral: true });
 
@@ -267,6 +318,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply('❌ Fluxo incompleto. Use **!vender** de novo.');
     }
 
+    // metadados
+    const guildId   = interaction.guildId || null;
+    const guildName = interaction.guild?.name || null;
+    const channelId = interaction.channelId || null;
+    const channelName2 = await resolveChannelName(interaction);
+    const messageJumpUrl = interaction.message?.url || null;
+
     try {
       await saveSale({
         tipo: ctx.tipo,
@@ -278,11 +336,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         observacao,
         userId: interaction.user.id,
         username: interaction.user.username,
+
+        // >>> metadados para n8n/planilha
+        channelId,
+        channelName: channelName2,
+        guildId,
+        guildName,
+        messageJumpUrl,
       });
 
       await interaction.editReply(
         `✅ Registrado: **${ctx.tipo} / ${ctx.marca} / ${ctx.sabor}** — **${quantidade}x** a **R$ ${Number(valor).toFixed(2)}**.\n` +
-        `📍 **${mesa}**${observacao ? ` · 📝 ${observacao}` : ''}`
+        `📍 **${mesa}**${observacao ? ` · 📝 ${observacao}` : ''}\n` +
+        (channelName2 ? `#️⃣ Canal: **${channelName2}**` : '')
       );
     } catch (e) {
       console.error('SAVE ERROR', e?.response?.status, e?.response?.data || e.message);
