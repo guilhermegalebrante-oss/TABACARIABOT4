@@ -14,10 +14,10 @@ import axios from 'axios';
 /* ================== ENV ================== */
 const DISCORD_TOKEN     = process.env.DISCORD_TOKEN;
 
-const WEBHOOK_TIPOS     = process.env.WEBHOOK_TIPOS;     // { tipo } -> { options:[...marcas] }
-const WEBHOOK_SABORES   = process.env.WEBHOOK_SABORES;   // { tipo, marca } -> { options:[...sabores] }
-const WEBHOOK_LASTPRICE = process.env.WEBHOOK_LASTPRICE; // { tipo, marca, sabor } -> { lastPrice:"25.00" } (opcional)
-const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { tipo, marca, sabor, valor, quantidade, mesa, observacao, userId, username, channelId, channelName, guildId, guildName }
+const WEBHOOK_TIPOS     = process.env.WEBHOOK_TIPOS;     // { tipo, ...meta } -> { options:[...marcas] }
+const WEBHOOK_SABORES   = process.env.Webhook_Sabores || process.env.WEBHOOK_SABORES; // compat
+const WEBHOOK_LASTPRICE = process.env.WEBHOOK_LASTPRICE; // { tipo, marca, sabor, ...meta } -> { lastPrice }
+const WEBHOOK_SAVE      = process.env.WEBHOOK_SAVE;      // { ...dados, ...meta }
 
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN ausente');
 for (const [k, v] of Object.entries({ WEBHOOK_TIPOS, WEBHOOK_SABORES, WEBHOOK_SAVE })) {
@@ -25,13 +25,13 @@ for (const [k, v] of Object.entries({ WEBHOOK_TIPOS, WEBHOOK_SABORES, WEBHOOK_SA
 }
 const HAS_LASTPRICE = !!WEBHOOK_LASTPRICE;
 
-// Whitelist opcional: nomes de canais separados por vírgula (ex: "loja-centro,loja-bairro")
+// opcional: restringe por nomes de canais (ex: "absolem-nome-da-cidade,canal-teste")
 const CHANNEL_WHITELIST = (process.env.CHANNEL_WHITELIST || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-/* ================== HELPERS UI ================== */
+/* ================== UI HELPERS ================== */
 function mainMenuRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('item:Rosh').setLabel('Rosh').setStyle(ButtonStyle.Primary),
@@ -72,18 +72,50 @@ async function post(url, payload, timeout = 15000) {
   const { data } = await axios.post(url, payload, { timeout });
   return data;
 }
-async function fetchMarcas(tipo) {
-  const data = await post(WEBHOOK_TIPOS, { tipo });
+
+/* === meta helpers === */
+async function resolveChannelName(client, interactionOrMessage) {
+  try {
+    const channel = interactionOrMessage.channel
+      ?? (interactionOrMessage.channelId
+            ? await client.channels.fetch(interactionOrMessage.channelId)
+            : null);
+    if (!channel) return null;
+    if ('name' in channel && channel.name) return channel.name;
+    if ('isDMBased' in channel && channel.isDMBased?.()) return 'DM';
+    return channel?.name ?? null;
+  } catch { return null; }
+}
+async function buildMetaFromInteraction(client, interaction) {
+  const channelName = await resolveChannelName(client, interaction);
+  return {
+    guildId:        interaction.guildId || null,
+    guildName:      interaction.guild?.name || null,
+    channelId:      interaction.channelId || null,
+    channelName,
+    userId:         interaction.user?.id || interaction.member?.user?.id || null,
+    username:       interaction.user?.username || interaction.member?.user?.username || null,
+    messageJumpUrl: interaction.message?.url || null,
+  };
+}
+function allowedByWhitelist(channelName) {
+  if (CHANNEL_WHITELIST.length === 0) return true;
+  return channelName && CHANNEL_WHITELIST.includes(channelName);
+}
+
+/* === webhooks que aceitam meta === */
+async function fetchMarcas(tipo, meta = {}) {
+  const data = await post(WEBHOOK_TIPOS, { tipo, ...meta });
   return Array.isArray(data?.options) ? data.options : [];
 }
-async function fetchSabores(tipo, marca) {
-  const data = await post(WEBHOOK_SABORES, { tipo, marca });
+async function fetchSabores(tipo, marca, meta = {}) {
+  const data = await post(WEBHOOK_SABORES, { tipo, marca, ...meta });
   return Array.isArray(data?.options) ? data.options : [];
 }
-async function fetchLastPrice(tipo, marca, sabor) {
+async function fetchLastPrice(tipo, marca, sabor, meta = {}) {
   if (!HAS_LASTPRICE) return '';
   try {
-    const data = await post(WEBHOOK_LASTPRICE, { tipo, marca, sabor });
+    const data = await post(WEBHOOK_LASTPRICE, { tipo, marca, sabor, ...meta });
     const v = String(data?.lastPrice ?? '').replace(',', '.').trim();
     return v && !isNaN(Number(v)) ? v : '';
   } catch { return ''; }
@@ -97,32 +129,11 @@ const ctxByUser = new Map(); // userId => { tipo, marca, sabor }
 
 /* ================== DISCORD ================== */
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   partials: [Partials.Channel, Partials.Message]
 });
 
 client.once(Events.ClientReady, () => console.log(`✅ Bot Tabacaria online: ${client.user.tag}`));
-
-/* Util: pega nome do canal com fallback (inclusive thread/DM) */
-async function resolveChannelName(interactionOrMessage) {
-  try {
-    const channel = interactionOrMessage.channel
-      ?? await client.channels.fetch(interactionOrMessage.channelId);
-    if (!channel) return null;
-    if ('name' in channel && channel.name) return channel.name;
-    if ('isDMBased' in channel && channel.isDMBased?.()) return 'DM';
-    // threads costumam ter name também
-    return channel?.name ?? null;
-  } catch { return null; }
-}
-function allowedByWhitelist(channelName) {
-  if (CHANNEL_WHITELIST.length === 0) return true;
-  return channelName && CHANNEL_WHITELIST.includes(channelName);
-}
 
 /* Trigger: !vender */
 client.on(Events.MessageCreate, async (message) => {
@@ -150,15 +161,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   // bloquear DM
   if (!interaction.guildId) {
-    if (interaction.isButton()) return interaction.reply({ content: '⚠️ Use dentro de um servidor.', ephemeral: true });
-    if (interaction.isModalSubmit()) return interaction.reply({ content: '⚠️ Use dentro de um servidor.', ephemeral: true });
+    const reply = { content: '⚠️ Use dentro de um servidor.', ephemeral: true };
+    if (interaction.isButton()) return interaction.reply(reply);
+    if (interaction.isModalSubmit()) return interaction.reply(reply);
     return;
   }
 
-  const channelName = await resolveChannelName(interaction);
+  const channelName = await resolveChannelName(client, interaction);
   if (!allowedByWhitelist(channelName)) {
-    if (interaction.isButton()) return interaction.reply({ content: '⛔ Canal não habilitado.', ephemeral: true });
-    if (interaction.isModalSubmit()) return interaction.reply({ content: '⛔ Canal não habilitado.', ephemeral: true });
+    const reply = { content: '⛔ Canal não habilitado.', ephemeral: true };
+    if (interaction.isButton()) return interaction.reply(reply);
+    if (interaction.isModalSubmit()) return interaction.reply(reply);
     return;
   }
 
@@ -184,14 +197,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.update({ content: '🛒 **Selecione o item vendido:**', components: [mainMenuRow()] });
     }
     if (to === 'tipo') {
-      const marcas = await fetchMarcas(ctx.tipo);
+      const meta = await buildMetaFromInteraction(client, interaction);
+      const marcas = await fetchMarcas(ctx.tipo, meta);
       return interaction.update({
         content: `🛒 **${ctx.tipo}** — escolha a **Marca**:`,
         components: [...chunkButtons(marcas, 'marca'), backRow('main')]
       });
     }
     if (to === 'marca') {
-      const sabores = await fetchSabores(ctx.tipo, ctx.marca);
+      const meta = await buildMetaFromInteraction(client, interaction);
+      const sabores = await fetchSabores(ctx.tipo, ctx.marca, meta);
       return interaction.update({
         content: `🛒 **${ctx.tipo} / ${ctx.marca}** — escolha o **Sabor**:`,
         components: [...chunkButtons(sabores, 'sabor'), backRow('tipo')]
@@ -199,13 +214,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // Passo 1: Tipo → marcas
+  // Passo 1: Tipo → marcas (manda meta no 1º webhook)
   if (interaction.isButton() && interaction.customId.startsWith('item:')) {
     const tipo = interaction.customId.split(':')[1];
     ctxByUser.set(interaction.user.id, { tipo });
 
     try {
-      const marcas = await fetchMarcas(tipo);
+      const meta = await buildMetaFromInteraction(client, interaction);
+      const marcas = await fetchMarcas(tipo, meta);
+
       if (!marcas.length) {
         return interaction.update({
           content: `⚠️ Webhook de marcas respondeu sem **options** para **${tipo}**.`,
@@ -224,7 +241,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // Passo 2: Marca → sabores
+  // Passo 2: Marca → sabores (manda meta)
   if (interaction.isButton() && interaction.customId.startsWith('marca:')) {
     const marca = interaction.customId.split(':')[1];
     const ctx = ctxByUser.get(interaction.user.id) || {};
@@ -232,7 +249,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     ctxByUser.set(interaction.user.id, ctx);
 
     try {
-      const sabores = await fetchSabores(ctx.tipo, ctx.marca);
+      const meta = await buildMetaFromInteraction(client, interaction);
+      const sabores = await fetchSabores(ctx.tipo, ctx.marca, meta);
+
       if (!sabores.length) {
         return interaction.update({
           content: `⚠️ Webhook de sabores respondeu sem **options** para **${ctx.marca}**.`,
@@ -251,14 +270,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  // Passo 3: Sabor → modal (com lastPrice se disponível)
+  // Passo 3: Sabor → modal (manda meta pro lastPrice)
   if (interaction.isButton() && interaction.customId.startsWith('sabor:')) {
     const sabor = interaction.customId.split(':')[1];
     const ctx = ctxByUser.get(interaction.user.id) || {};
     ctx.sabor = sabor;
     ctxByUser.set(interaction.user.id, ctx);
 
-    const lastPrice = await fetchLastPrice(ctx.tipo, ctx.marca, ctx.sabor);
+    const meta = await buildMetaFromInteraction(client, interaction);
+    const lastPrice = await fetchLastPrice(ctx.tipo, ctx.marca, ctx.sabor, meta);
 
     const modal = new ModalBuilder()
       .setCustomId('modal:save')
@@ -300,7 +320,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.showModal(modal);
   }
 
-  // Passo 4: Modal → save (com metadados de canal/servidor)
+  // Passo 4: Modal → save (manda meta)
   if (interaction.isModalSubmit() && interaction.customId === 'modal:save') {
     await interaction.deferReply({ ephemeral: true });
 
@@ -318,12 +338,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply('❌ Fluxo incompleto. Use **!vender** de novo.');
     }
 
-    // metadados
-    const guildId   = interaction.guildId || null;
-    const guildName = interaction.guild?.name || null;
-    const channelId = interaction.channelId || null;
-    const channelName2 = await resolveChannelName(interaction);
-    const messageJumpUrl = interaction.message?.url || null;
+    const meta = await buildMetaFromInteraction(client, interaction);
 
     try {
       await saveSale({
@@ -336,19 +351,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         observacao,
         userId: interaction.user.id,
         username: interaction.user.username,
-
-        // >>> metadados para n8n/planilha
-        channelId,
-        channelName: channelName2,
-        guildId,
-        guildName,
-        messageJumpUrl,
+        ...meta, // channelId, channelName, guildId, guildName, messageJumpUrl...
       });
 
       await interaction.editReply(
         `✅ Registrado: **${ctx.tipo} / ${ctx.marca} / ${ctx.sabor}** — **${quantidade}x** a **R$ ${Number(valor).toFixed(2)}**.\n` +
         `📍 **${mesa}**${observacao ? ` · 📝 ${observacao}` : ''}\n` +
-        (channelName2 ? `#️⃣ Canal: **${channelName2}**` : '')
+        (meta.channelName ? `#️⃣ Canal: **${meta.channelName}**` : '')
       );
     } catch (e) {
       console.error('SAVE ERROR', e?.response?.status, e?.response?.data || e.message);
